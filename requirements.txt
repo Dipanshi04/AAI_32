@@ -1,10 +1,10 @@
 crewai
 langchain-google-genai
 ddgs
-python-dotenv
-pandas
-openpyxl
-xlrd
-streamlit
-chromadb
-sentence-transformers
+streamlit>=1.32,<2
+pandas>=2.2,<3
+chromadb>=0.5,<1
+sentence-transformers>=2.6,<3
+python-dotenv>=1.0,<2
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
