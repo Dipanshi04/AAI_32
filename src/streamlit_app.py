@@ -56,7 +56,7 @@ def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
 
 
 st.set_page_config(page_title="Supplier Search", page_icon="🔎", layout="wide")
-st.title("Mutliagent Manufacturing Creator")
+st.title("Mutliagent Manufacturing System For Supplier Sourcing")
 st.caption("Type in the search box to find related suppliers.")
 
 search_text = st.text_input(

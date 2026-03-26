@@ -1,10 +1,17 @@
+<<<<<<< HEAD
 crewai
 langchain-google-genai
 ddgs
+=======
+>>>>>>> e68c7ef (update streamlit_app.py)
 streamlit>=1.32,<2
 pandas>=2.2,<3
 chromadb>=0.5,<1
 sentence-transformers>=2.6,<3
 python-dotenv>=1.0,<2
 openpyxl>=3.1,<4
+<<<<<<< HEAD
 xlrd>=2.0,<3
+=======
+xlrd>=2.0,<3
+>>>>>>> e68c7ef (update streamlit_app.py)
