@@ -23,7 +23,6 @@ __pycache__/
 
 # Local outputs and vector DB artifacts
 outputs/
-data/chroma/
 
 # OS files
 .DS_Store
