@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
+SRC = ROOT / "D3_Group 08D3_AAI-32"
 APP = SRC / "streamlit_app.py"
 
 if str(SRC) not in sys.path:

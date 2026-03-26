@@ -1,7 +1,7 @@
 from crewai import Crew, Process
-from src.agents import researcher, writer
-from src.tasks import research_task, write_task
-from src.vector_index import query_suppliers
+from agents import researcher, writer
+from tasks import research_task, write_task
+from vector_index import query_suppliers
 
 
 def _build_chroma_context(need: str, n_results: int = 8) -> str:

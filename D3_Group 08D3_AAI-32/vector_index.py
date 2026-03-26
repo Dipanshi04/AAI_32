@@ -374,7 +374,7 @@ def query_suppliers(
             collection = _get_collection_for_query()
             if collection.count() == 0:
                 raise RuntimeError(
-                    "Supplier vector index is empty even after rebuild. Check data/suppliers.csv and rerun: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
+                    "Supplier vector index is empty even after rebuild. Check data/suppliers.csv and rerun: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe \"D3_Group 08D3_AAI-32/rebuild_vector_index.py\""
                 )
 
         # Auto-upgrade legacy indexed metadata once per process instead of on every query.
