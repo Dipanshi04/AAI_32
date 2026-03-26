@@ -35,6 +35,10 @@ def _ensure_chroma_dependencies() -> None:
         )
 
 
+def _has_chroma_dependencies() -> bool:
+    return chromadb is not None and embedding_functions is not None
+
+
 def find_supplier_file() -> Path | None:
     if not DATA_DIR.exists():
         return None
@@ -189,6 +193,99 @@ def _keyword_overlap_score(query: str, candidate: str) -> float:
     return overlap / max(1, len(query_tokens))
 
 
+def _search_blob(doc: str, meta: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(meta.get("supplier", "")),
+            str(meta.get("city", "")) or str(meta.get("Location", "")),
+            str(meta.get("material_type", "")),
+            str(meta.get("material_name", "")),
+            str(meta.get("specialization", "")),
+            doc,
+        ]
+    )
+
+
+def _rank_candidates(
+    query: str,
+    candidates: list[tuple[str, dict[str, Any], float | None]],
+    n_results: int,
+    subcategory: str | None,
+    strict_subcategory: bool,
+    apply_min_score: bool,
+) -> list[tuple[str, dict[str, Any], float]]:
+    subcategory_text = (subcategory or "").strip()
+    ranked: list[tuple[float, str, dict[str, Any], float]] = []
+
+    for doc, meta, semantic_score in candidates:
+        blob = _search_blob(doc, meta)
+        keyword_score = _keyword_overlap_score(query, blob)
+        subcategory_score = _keyword_overlap_score(subcategory_text, blob) if subcategory_text else 0.0
+
+        if subcategory_text and strict_subcategory and subcategory_score == 0.0:
+            continue
+
+        base_score = keyword_score
+        if semantic_score is not None:
+            base_score = (SEMANTIC_WEIGHT * semantic_score) + (KEYWORD_WEIGHT * keyword_score)
+
+        hybrid_score = (0.70 * base_score) + (0.30 * subcategory_score) if subcategory_text else base_score
+        if semantic_score is None and hybrid_score <= 0.0:
+            continue
+
+        distance = 1.0 - hybrid_score if semantic_score is None else 1.0 - semantic_score
+        ranked.append((hybrid_score, doc, meta, max(0.0, float(distance))))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if apply_min_score:
+        filtered = [item for item in ranked if item[0] >= MIN_HYBRID_SCORE]
+        selected = filtered[:n_results] if filtered else ranked[:n_results]
+    else:
+        selected = ranked[:n_results]
+    return [(item[1], item[2], item[3]) for item in selected]
+
+
+def _to_query_response(items: list[tuple[str, dict[str, Any], float]]) -> dict[str, Any]:
+    return {
+        "documents": [[item[0] for item in items]],
+        "metadatas": [[item[1] for item in items]],
+        "distances": [[item[2] for item in items]],
+    }
+
+
+def _query_suppliers_fallback(
+    query: str,
+    n_results: int = 5,
+    subcategory: str | None = None,
+    strict_subcategory: bool = False,
+) -> dict[str, Any]:
+    supplier_file = find_supplier_file()
+    if supplier_file is None:
+        return _to_query_response([])
+
+    df = load_supplier_df(supplier_file)
+    if df.empty:
+        return _to_query_response([])
+
+    candidates: list[tuple[str, dict[str, Any], float | None]] = []
+
+    for _, row in df.iterrows():
+        doc, metadata = _build_document(row)
+        if not doc:
+            continue
+        candidates.append((doc, metadata, None))
+
+    ranked_items = _rank_candidates(
+        query=query,
+        candidates=candidates,
+        n_results=n_results,
+        subcategory=subcategory,
+        strict_subcategory=strict_subcategory,
+        apply_min_score=False,
+    )
+    return _to_query_response(ranked_items)
+
+
 def index_suppliers(force: bool = False) -> dict[str, Any]:
     _ensure_chroma_dependencies()
 
@@ -256,86 +353,68 @@ def query_suppliers(
     subcategory: str | None = None,
     strict_subcategory: bool = False,
 ) -> dict[str, Any]:
-    _ensure_chroma_dependencies()
+    if not _has_chroma_dependencies():
+        return _query_suppliers_fallback(
+            query=query,
+            n_results=n_results,
+            subcategory=subcategory,
+            strict_subcategory=strict_subcategory,
+        )
 
     try:
-        collection = _get_collection_for_query()
-    except BaseException:
-        # Auto-heal a missing collection by rebuilding once from source data.
-        index_suppliers(force=True)
-        collection = _get_collection_for_query()
+        try:
+            collection = _get_collection_for_query()
+        except BaseException:
+            # Auto-heal a missing collection by rebuilding once from source data.
+            index_suppliers(force=True)
+            collection = _get_collection_for_query()
 
-    if collection.count() == 0:
-        index_suppliers(force=True)
-        collection = _get_collection_for_query()
         if collection.count() == 0:
-            raise RuntimeError(
-                "Supplier vector index is empty even after rebuild. Check data/suppliers.csv and rerun: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
-            )
+            index_suppliers(force=True)
+            collection = _get_collection_for_query()
+            if collection.count() == 0:
+                raise RuntimeError(
+                    "Supplier vector index is empty even after rebuild. Check data/suppliers.csv and rerun: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
+                )
 
-    # Auto-upgrade legacy indexed metadata once per process instead of on every query.
-    if not _is_metadata_schema_compatible():
-        index_suppliers(force=True)
-        collection = _get_collection_for_query()
-        _is_metadata_schema_compatible.cache_clear()
-        _is_metadata_schema_compatible()
+        # Auto-upgrade legacy indexed metadata once per process instead of on every query.
+        if not _is_metadata_schema_compatible():
+            index_suppliers(force=True)
+            collection = _get_collection_for_query()
+            _is_metadata_schema_compatible.cache_clear()
+            _is_metadata_schema_compatible()
 
-    candidate_count = max(n_results * max(1, QUERY_CANDIDATE_MULTIPLIER), 8)
-    response = collection.query(
-        query_texts=[query],
-        n_results=candidate_count,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    docs = response.get("documents", [[]])[0]
-    metadatas = response.get("metadatas", [[]])[0]
-    distances = response.get("distances", [[]])[0]
-
-    ranked: list[tuple[float, str, dict[str, Any], float]] = []
-    subcategory_text = (subcategory or "").strip()
-    for idx, doc in enumerate(docs):
-        meta = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
-        distance = distances[idx] if idx < len(distances) and isinstance(distances[idx], (float, int)) else 1.0
-        semantic_score = max(0.0, 1.0 - float(distance))
-        keyword_source = " ".join(
-            [
-                str(meta.get("supplier", "")),
-                str(meta.get("Location", "")),
-                str(doc),
-            ]
+        candidate_count = max(n_results * max(1, QUERY_CANDIDATE_MULTIPLIER), 8)
+        response = collection.query(
+            query_texts=[query],
+            n_results=candidate_count,
+            include=["documents", "metadatas", "distances"],
         )
-        keyword_score = _keyword_overlap_score(query, keyword_source)
-        subcategory_score = 0.0
-        if subcategory_text:
-            subcategory_source = " ".join(
-                [
-                    str(meta.get("material_type", "")),
-                    str(meta.get("material_name", "")),
-                    str(meta.get("specialization", "")),
-                    str(doc),
-                ]
-            )
-            subcategory_score = _keyword_overlap_score(subcategory_text, subcategory_source)
-            if strict_subcategory and subcategory_score == 0.0:
-                continue
 
-        base_hybrid = (SEMANTIC_WEIGHT * semantic_score) + (KEYWORD_WEIGHT * keyword_score)
-        if subcategory_text:
-            hybrid_score = (0.70 * base_hybrid) + (0.30 * subcategory_score)
-        else:
-            hybrid_score = base_hybrid
-        ranked.append((hybrid_score, str(doc), meta, float(distance)))
+        docs = response.get("documents", [[]])[0]
+        metadatas = response.get("metadatas", [[]])[0]
+        distances = response.get("distances", [[]])[0]
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    filtered = [item for item in ranked if item[0] >= MIN_HYBRID_SCORE]
-    selected = filtered[:n_results] if filtered else ranked[:n_results]
+        candidates: list[tuple[str, dict[str, Any], float | None]] = []
+        for idx, doc in enumerate(docs):
+            meta = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
+            distance = distances[idx] if idx < len(distances) and isinstance(distances[idx], (float, int)) else 1.0
+            semantic_score = max(0.0, 1.0 - float(distance))
+            candidates.append((str(doc), meta, semantic_score))
 
-    final_docs = [item[1] for item in selected]
-    final_metas = [item[2] for item in selected]
-    final_distances = [item[3] for item in selected]
-
-    return {
-        "documents": [final_docs],
-        "metadatas": [final_metas],
-        "distances": [final_distances],
-    }
+        ranked_items = _rank_candidates(
+            query=query,
+            candidates=candidates,
+            n_results=n_results,
+            subcategory=subcategory,
+            strict_subcategory=strict_subcategory,
+            apply_min_score=True,
+        )
+        return _to_query_response(ranked_items)
+    except Exception:
+        return _query_suppliers_fallback(
+            query=query,
+            n_results=n_results,
+            subcategory=subcategory,
+            strict_subcategory=strict_subcategory,
+        )
