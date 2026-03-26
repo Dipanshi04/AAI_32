@@ -13,7 +13,7 @@ def _safe_text(value: object) -> str:
     return text if text else ""
 
 
-def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
+def _result_rows_uncached(query: str, n_results: int = 10) -> list[dict[str, str]]:
     response = query_suppliers(query=query, n_results=n_results)
     metadatas = response.get("metadatas", [[]])[0]
     distances = response.get("distances", [[]])[0]
@@ -26,7 +26,8 @@ def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
         material_type = _safe_text(metadata.get("material_type") or metadata.get("Category"))
         material_name = _safe_text(metadata.get("material_name") or metadata.get("Subcategory") or metadata.get("Sub_Category"))
         location = _safe_text(metadata.get("city") or metadata.get("Location"))
-        remaining = _safe_text(metadata.get("remaining") or metadata.get("Remaining"))
+        cost_per_unit = _safe_text(metadata.get("cost_per_unit_usd") or metadata.get("Unit_Price"))
+        reliability = _safe_text(metadata.get("reliability_score") or metadata.get("Quality_Rating"))
 
         similarity = "-"
         if isinstance(distance, (int, float)):
@@ -38,10 +39,9 @@ def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
                 "Material_Type": material_type or "-",
                 "Material_Name": material_name or "-",
                 "Location": location or "-",
-                "Remaining": remaining or "-",
                 "Lead_Time_Days": _safe_text(metadata.get("lead_time_days")) or "-",
-                "Cost_per_Unit_USD": _safe_text(metadata.get("cost_per_unit_usd")) or "-",
-                "Reliability_Score": _safe_text(metadata.get("reliability_score")) or "-",
+                "Cost_per_Unit_USD": cost_per_unit or "-",
+                "Reliability_Score": reliability or "-",
                 "Contact_Email": _safe_text(metadata.get("contact_email")) or "-",
                 "Similarity": similarity,
             }
@@ -50,13 +50,18 @@ def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
     return rows
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def _result_rows(query: str, n_results: int = 10) -> list[dict[str, str]]:
+    return _result_rows_uncached(query=query, n_results=n_results)
+
+
 st.set_page_config(page_title="Supplier Search", page_icon="🔎", layout="wide")
 st.title("Mutliagent Manufacturing Creator")
 st.caption("Type in the search box to find related suppliers.")
 
 search_text = st.text_input(
     "Search",
-    placeholder="Examples: CNC machining, aluminum, circuit boards, stainless steel",
+    placeholder="Examples: Iron, Lithium, steel..",
 )
 
 if st.button("Find Suppliers", type="primary"):

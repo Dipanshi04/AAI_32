@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ EMBEDDING_MODEL = os.getenv("SUPPLIER_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 MIN_HYBRID_SCORE = float(os.getenv("SUPPLIER_MIN_HYBRID_SCORE", "0.35"))
 SEMANTIC_WEIGHT = float(os.getenv("SUPPLIER_SEMANTIC_WEIGHT", "0.75"))
 KEYWORD_WEIGHT = float(os.getenv("SUPPLIER_KEYWORD_WEIGHT", "0.25"))
+QUERY_CANDIDATE_MULTIPLIER = int(os.getenv("SUPPLIER_QUERY_CANDIDATE_MULTIPLIER", "2"))
 
 
 def _ensure_chroma_dependencies() -> None:
@@ -36,7 +38,13 @@ def _ensure_chroma_dependencies() -> None:
 def find_supplier_file() -> Path | None:
     if not DATA_DIR.exists():
         return None
-    matches = sorted([path for path in DATA_DIR.glob("suppliers*") if path.is_file()])
+    matches = sorted(
+        [
+            path
+            for path in DATA_DIR.glob("suppliers*")
+            if path.is_file() and not path.name.startswith("~$")
+        ]
+    )
     return matches[0] if matches else None
 
 
@@ -63,11 +71,13 @@ def _build_document(row: pd.Series) -> tuple[str, dict[str, str]]:
         "name",
         "Company",
         "Category",
+        "Subcategory",
         "Sub_Category",
         "Location",
-        "Remaining",
         "Lead_Time_Days",
+        "Unit_Price",
         "Cost_per_Unit_USD",
+        "Quality_Rating",
         "Reliability_Score",
         "Contact_Email",
     ]
@@ -86,10 +96,9 @@ def _build_document(row: pd.Series) -> tuple[str, dict[str, str]]:
         "material_type": values.get("Category") or "",
         "material_name": values.get("Subcategory") or values.get("Sub_Category") or "",
         "city": values.get("Location") or "",
-        "remaining": values.get("Remaining") or values.get("remaining") or "",
         "lead_time_days": values.get("Lead_Time_Days") or "",
-        "cost_per_unit_usd": values.get("Cost_per_Unit_USD") or "",
-        "reliability_score": values.get("Reliability_Score") or "",
+        "cost_per_unit_usd": values.get("Cost_per_Unit_USD") or values.get("Unit_Price") or "",
+        "reliability_score": values.get("Reliability_Score") or values.get("Quality_Rating") or "",
         "contact_email": values.get("Contact_Email") or "",
     }
 
@@ -115,10 +124,26 @@ def _get_embedder():
     return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
 
 
+def _reset_chroma_storage() -> None:
+    _is_metadata_schema_compatible.cache_clear()
+    _get_collection_for_query.cache_clear()
+    _get_client.cache_clear()
+    if CHROMA_DIR.exists():
+        shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 @lru_cache(maxsize=1)
 def _get_client():
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(CHROMA_DIR))
+    try:
+        return chromadb.PersistentClient(path=str(CHROMA_DIR))
+    except BaseException as exc:
+        message = str(exc).lower()
+        if "default_tenant" in message or "tenant" in message or "panic" in message:
+            _reset_chroma_storage()
+            return chromadb.PersistentClient(path=str(CHROMA_DIR))
+        raise
 
 
 @lru_cache(maxsize=1)
@@ -126,6 +151,27 @@ def _get_collection_for_query():
     client = _get_client()
     embedder = _get_embedder()
     return client.get_collection(name=COLLECTION_NAME, embedding_function=embedder)
+
+
+@lru_cache(maxsize=1)
+def _is_metadata_schema_compatible() -> bool:
+    try:
+        collection = _get_collection_for_query()
+        probe = collection.get(limit=1, include=["metadatas"])
+        probe_meta = probe.get("metadatas", []) if isinstance(probe, dict) else []
+        first_meta = probe_meta[0] if probe_meta and isinstance(probe_meta[0], dict) else {}
+        if not first_meta:
+            return True
+        required_keys = {
+            "material_name",
+            "lead_time_days",
+            "cost_per_unit_usd",
+            "reliability_score",
+            "contact_email",
+        }
+        return required_keys.issubset(set(first_meta.keys()))
+    except Exception:
+        return True
 
 
 def _tokenize(text: str) -> list[str]:
@@ -193,6 +239,7 @@ def index_suppliers(force: bool = False) -> dict[str, Any]:
 
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     FINGERPRINT_FILE.write_text(fingerprint, encoding="utf-8")
+    _is_metadata_schema_compatible.cache_clear()
     _get_collection_for_query.cache_clear()
 
     return {
@@ -213,37 +260,27 @@ def query_suppliers(
 
     try:
         collection = _get_collection_for_query()
-    except Exception as exc:
-        raise RuntimeError(
-            "Supplier vector index is missing. Run: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
-        ) from exc
+    except BaseException:
+        # Auto-heal a missing collection by rebuilding once from source data.
+        index_suppliers(force=True)
+        collection = _get_collection_for_query()
 
     if collection.count() == 0:
-        raise RuntimeError(
-            "Supplier vector index is empty. Run: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
-        )
+        index_suppliers(force=True)
+        collection = _get_collection_for_query()
+        if collection.count() == 0:
+            raise RuntimeError(
+                "Supplier vector index is empty even after rebuild. Check data/suppliers.csv and rerun: c:/Users/Admin/Desktop/GAI08/env/Scripts/python.exe src/rebuild_vector_index.py"
+            )
 
-    # Auto-upgrade legacy indexed metadata that predates subcategory fields.
-    try:
-        probe = collection.get(limit=1, include=["metadatas"])
-        probe_meta = probe.get("metadatas", []) if isinstance(probe, dict) else []
-        first_meta = probe_meta[0] if probe_meta and isinstance(probe_meta[0], dict) else {}
-        required_keys = {
-            "material_name",
-            "remaining",
-            "lead_time_days",
-            "cost_per_unit_usd",
-            "reliability_score",
-            "contact_email",
-        }
-        if first_meta and not required_keys.issubset(set(first_meta.keys())):
-            index_suppliers(force=True)
-            collection = _get_collection_for_query()
-    except Exception:
-        # If probing fails, continue with existing collection; regular query error handling applies.
-        pass
+    # Auto-upgrade legacy indexed metadata once per process instead of on every query.
+    if not _is_metadata_schema_compatible():
+        index_suppliers(force=True)
+        collection = _get_collection_for_query()
+        _is_metadata_schema_compatible.cache_clear()
+        _is_metadata_schema_compatible()
 
-    candidate_count = max(n_results * 3, 10)
+    candidate_count = max(n_results * max(1, QUERY_CANDIDATE_MULTIPLIER), 8)
     response = collection.query(
         query_texts=[query],
         n_results=candidate_count,
